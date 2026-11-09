@@ -7,9 +7,12 @@ logout/login and scheduled-sync checks are user-reported; the read-only username
 lookup was separately validated with an existing session. Live different-account
 switching and its destructive cleanup remain **unresolved**, not validated: the
 current user has no second Cloud account (one cannot be created without another
-device). This is the only Cloud-specific live validation item currently
-outstanding and is not a blocker to the implemented Cloud feature set. Updated
-October 16, 2026.
+device). This remains a Cloud-specific live validation gap, not a blocker to the
+implemented Cloud feature set. Local ID-matched rename handling is implemented
+with synthetic tests. The user has now verified Cloud-to-raw-note-to-Markdown
+renames in Marie in both directions (A to B and B to A). A direct before/after
+hosted file-ID and checksum comparison remains unverified. Updated November 9,
+2026.
 
 This document tracks implementation sequencing, engineering decisions, and
 validation status. The user-observable behavior, endpoint contract, protocol
@@ -271,16 +274,45 @@ requirements remain in [`cloud-protocol-harness.md`](cloud-protocol-harness.md).
   does not exercise the account-change confirmation, which only arises during
   interactive sign-in with a different verified account.
 
+### Sprint 8: Local Cloud rename handling (complete)
+
+Cloud records persist optional account-bound file IDs. Matching a verified new
+path to an old managed ID with unchanged checksum and local bytes, a vacant
+destination, and two matching inventories permits a guarded local FileManager
+rename before download or Trash. Nested file moves cover file-bearing folder
+moves; empty folders have no identity. Move intent is persisted and reconciled
+after restart. Different IDs and legacy path-only records are never matched by
+name or hash. Synthetic tests cover conflicts, recovery, repeated runs, and the
+Markdown-only exporter handoff. No remote Cloud write route was added.
+
+The initial reverse rename left the raw note renamed but the managed Markdown
+blocked. Read-only comparison established that the Markdown differed from its
+saved managed hash solely by a rewritten link to the newly named note; reversing
+that exact name change reproduced the saved hash. The actor and precise event
+order were not independently captured. The exporter now accepts only a source
+link name/path rewrite that reverses to the saved hash, including during pending
+move recovery; unrelated content edits, occupied destinations, missing files,
+and exports with page attachments remain protected. A command can discard stale
+ownership for a genuinely missing Markdown-only export and queue regeneration.
+The user subsequently verified in Marie that a rename originating in Cloud
+propagates through the raw note to its Markdown export in both directions, A to
+B and B to A. This completes the local rename handoff. It is not a direct
+before/after hosted file-ID and checksum comparison.
+
 ## Implementation Closeout
 
-No further Cloud feature sprint is planned here. Ordinary download/write and
-remote-deletion Trash crash recovery is tracked as a deferred Multi-Sync scope
-decision in [`multi-sync-plan.md`](multi-sync-plan.md), not as incomplete Cloud
-implementation and not as a promise of the next shared-manifest sprint. Other
-unobserved hosted-service cases remain documented as unknowns with fail-closed
-behavior in [`cloud-sync-design.md`](cloud-sync-design.md); they do not by
-themselves call for another Cloud sprint. Live account-switch validation remains
-the separate unresolved evidence gap above, not a completed release gate.
+The existing Cloud feature set and local rename handling are implemented and the
+user has verified the Cloud-to-Markdown rename round trip. Direct hosted
+identity comparison remains optional validation; see
+[`cloud-sync-next-steps.md`](cloud-sync-next-steps.md). Ordinary download/write
+and remote-deletion Trash crash recovery is tracked as a deferred Multi-Sync
+scope decision in [`multi-sync-plan.md`](multi-sync-plan.md), not as incomplete
+Cloud implementation and not as a promise of the next shared-manifest sprint.
+Other unobserved hosted-service cases remain documented as unknowns with
+fail-closed behavior in [`cloud-sync-design.md`](cloud-sync-design.md); they do
+not by themselves call for another Cloud sprint. Live account-switch validation
+remains the separate unresolved evidence gap above, not a completed release
+gate.
 
 ### Remaining Live Validation: Different-Account Switch
 
@@ -297,8 +329,9 @@ no-background-sign-in only; it does not exercise this interactive flow.
 
 Ordinary download/write and remote-deletion Trash crash recovery is tracked
 separately in [`multi-sync-plan.md`](multi-sync-plan.md); it is not incomplete
-Cloud implementation. No further Cloud feature sprint is planned unless new
-evidence or a product requirement changes that scope.
+Cloud implementation. The completed rename work is recorded above; its live
+round trip must not be mistaken for a direct proof that hosted file IDs survive
+renames.
 
 ## Validation Gates
 
@@ -337,6 +370,17 @@ the value supplied by the user; it was not retained. The username UI changes
 passed `npm test` (449 passing), `npm run build`, `npm run lint` (0 errors, 12
 warnings), and `git diff --check`. Scheduled-sync outcomes are user-reported as
 recorded in Sprint 7, not independently captured.
+
+Sprint 8 and its reverse-rename diagnostic handoff passed focused automatic
+export tests, `npm test` (580 passing), `npm run build`, `npm run lint` (zero
+errors, 20 existing warnings), and `git diff --check`. Forward/reverse behavior
+was subsequently verified by the user in Marie, their designated test vault. The
+link-rewrite and missing-export recovery follow-up passed focused automatic
+export tests (45 passing), `npm test` (590 passing), `npm run build`,
+`npm run
+lint` (zero errors, 20 warnings), and `git diff --check`. The actual
+writer and event order were not instrumented, and no direct hosted before/after
+file-ID and checksum comparison was performed.
 
 Do not use production login/OTP, delete or clear harness cache, or broaden the
 test-vault fixture scope without separate explicit authorization. Keep protocol

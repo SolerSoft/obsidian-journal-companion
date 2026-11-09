@@ -1,5 +1,5 @@
 import { installAtPolyfill } from './polyfills';
-import { App, Modal, Notice, TFile, Plugin, Editor, MarkdownView, MarkdownFileInfo, WorkspaceLeaf, FileView, Component, Scope, Platform, setIcon } from 'obsidian';
+import { App, Modal, Notice, Setting, TFile, Plugin, Editor, MarkdownView, MarkdownFileInfo, WorkspaceLeaf, FileView, Component, Scope, Platform, setIcon } from 'obsidian';
 import { SupernotePluginSettings, SupernoteSettingTab, DEFAULT_SETTINGS, ImportFormat, PageExportImageFormat } from './settings';
 import { tryRegisterNoteViewer } from './noteViewerRegistration';
 import { SupernoteX, ILink, RecognitionStatuses, fetchMirrorFrame, extractPdfPageData, addSvgPage, prepareVectorInkPages, buildVectorInkBackgroundNote, buildRasterInkOverlayNote, toSvg } from 'supernote-typescript';
@@ -34,6 +34,9 @@ import { CloudSessionStorage } from './sync/supernoteCloud/cloudSessionStorage';
 import { CloudSignInRequiredError, CloudSyncEngine } from './sync/supernoteCloud/cloudSyncEngine';
 import { SupernoteAtelierEmbed, SupernoteAtelierView, VIEW_TYPE_SUPERNOTE_ATELIER, renderAtelierCompositeDataUrl, renderAtelierCompositeFromBuffer } from './atelierView';
 import { PDFDocument } from 'pdf-lib';
+import { AutomaticMarkdownExport } from './automaticMarkdownExport';
+import type { AutomaticMarkdownResult } from './automaticMarkdownExport';
+import type { NoteConversion } from './settings';
 
 function generateTimestamp(): string {
 	const date = new Date();
@@ -229,13 +232,12 @@ function processSupernoteText(text: string, settings: SupernotePluginSettings): 
 // In-process extension point for other Obsidian plugins that want to enrich
 // a page's text before it lands in the generated markdown — e.g. an OCR/LLM
 // companion plugin transcribing handwriting the device's own recognition
-// missed (see https://github.com/philips/supernote-obsidian-ocr-llm for a
-// reference implementation against a local OpenAI-compatible server).
+// missed (see ocr-plugins.md for the integration contract).
 // Undocumented by design: the
 // same "reach into another plugin's loaded instance" pattern Templater/
 // Dataview expose their own APIs through, since Obsidian has no formal
 // inter-plugin dependency mechanism. Callers must feature-detect
-// (`app.plugins.plugins['supernote']?.registerPageTextProcessor`) and accept
+// (`app.plugins.plugins['journal-companion']?.registerPageTextProcessor`) and accept
 // that this can change across versions.
 export interface PageTextProcessorContext {
 	/** 1-indexed, matching the "## Page N" headings in the generated markdown. */
@@ -390,8 +392,6 @@ class VaultWriter {
 	// export passes `imgs: null` but can still pass `images` so registered
 	// processors run, even though no image attachment gets saved.
 	async writeMarkdownFile(file: TFile, sn: SupernoteX, imgs: TFile[] | null, images: string[] | null = null): Promise<TFile> {
-		let content = '';
-
 		// Generate a non-conflicting filename - it has a bit of a race but that is OK
 		let filename = `${file.parent?.path}/${file.basename}.md`;
 		let i = 0;
@@ -399,7 +399,12 @@ class VaultWriter {
 			filename = `${file.parent?.path}/${file.basename} ${++i}.md`;
 		}
 
-		content = this.app.fileManager.generateMarkdownLink(file, filename);
+		const content = await this.renderMarkdownFile(file, sn, filename, imgs, images);
+		return this.app.vault.create(filename, content);
+	}
+
+	async renderMarkdownFile(file: TFile, sn: SupernoteX, filename: string, imgs: TFile[] | null = null, images: string[] | null = null, imagePaths: string[] = []): Promise<string> {
+		let content = this.app.fileManager.generateMarkdownLink(file, filename);
 		content += '\n';
 
 		for (let i = 0; i < sn.pages.length; i++) {
@@ -420,9 +425,13 @@ class VaultWriter {
 				const link = generateMarkdownImageEmbed(this.app, imgs[i], filename, alt);
 				content += `${link}\n`;
 			}
+			if (imagePaths[i]) {
+				const alt = this.settings.invertColorsWhenDark ? 'supernote-invert-dark' : '';
+				content += `![${alt}](${encodeURI(imagePaths[i])})\n`;
+			}
 		}
 
-		return this.app.vault.create(filename, content);
+		return content;
 	}
 
 	// `images` is already-rasterized page data URLs (see rasterizePages()) —
@@ -462,6 +471,18 @@ class VaultWriter {
 		const images = this.processors.size > 0 ? await this.rasterizePages(sn) : null;
 		const mdFile = await this.writeMarkdownFile(file, sn, null, images);
 		this.notifyExportComplete(mdFile);
+	}
+
+	async renderAutomaticMarkdown(file: TFile, destination: string, note: ArrayBuffer, format: NoteConversion): Promise<AutomaticMarkdownResult> {
+		const sn = new SupernoteX(new Uint8Array(note));
+		const images = this.processors.size > 0 || format !== 'markdown' ? await this.rasterizePages(sn) : null;
+		const attachments = images && format !== 'markdown' ? images.map((image, index) => ({
+			path: `${destination.slice(0, -3)}-pages/${index + 1}.${format}`,
+			content: format === 'png' ? dataUrlToBuffer(image)
+				: new TextEncoder().encode(buildSvgForPage(sn, index + 1, image)).buffer,
+		})) : [];
+		const imagePaths = attachments.map((attachment) => attachment.path.slice(destination.lastIndexOf('/') + 1));
+		return { content: await this.renderMarkdownFile(file, sn, destination, null, images, imagePaths), attachments };
 	}
 
 	async attachNoteFiles(file: TFile) {
@@ -1151,6 +1172,7 @@ export default class SupernotePlugin extends Plugin {
 	vaultWriter!: VaultWriter;
 	private syncCoordinator!: SyncCoordinator;
 	private syncRootChange!: SyncRootChange;
+	private automaticMarkdownExport?: AutomaticMarkdownExport;
 	private noteViewerRegistered = false;
 	private cloudSignInModal: CloudSignInModal | null = null;
 	// Live reference handed to VaultWriter — registering/unregistering here
@@ -1162,8 +1184,7 @@ export default class SupernotePlugin extends Plugin {
 	 * it's written into the generated markdown — e.g. an OCR/LLM companion
 	 * plugin transcribing handwriting the device's own recognition missed.
 	 * See PageTextProcessor's doc comment (above VaultWriter) for the
-	 * contract, and https://github.com/philips/supernote-obsidian-ocr-llm
-	 * for a reference implementation.
+	 * contract and ocr-plugins.md for integration guidance.
 	 *
 	 * Undocumented/unstable: the same "reach into another plugin's loaded
 	 * instance" pattern Templater/Dataview use for their own APIs, not a
@@ -1232,8 +1253,90 @@ export default class SupernotePlugin extends Plugin {
 		});
 		vw = new VaultWriter(this.app, this.settings, this.pageTextProcessors);
 		this.vaultWriter = vw;
+		this.automaticMarkdownExport = new AutomaticMarkdownExport(this.app, this.settings,
+			() => this.saveSettings(), (file, path, bytes, format) => this.vaultWriter.renderAutomaticMarkdown(file, path, bytes, format),
+			(source, destination, reason) => {
+				const logRoot = this.settings.markdownExportMappings.find((pair) => pair.enabled &&
+					(!pair.watchDir || source.startsWith(`${pair.watchDir}/`)))?.outputDir;
+				const logHint = this.settings.markdownExportErrorLogEnabled && logRoot !== undefined &&
+					!reason.startsWith('Could not write Markdown export log') &&
+					!reason.startsWith('Invalid automatic Markdown export settings')
+					? ` See ${logRoot ? `${logRoot}/` : ''}Markdown Export Log.md.` : '';
+				const notice = new Notice(`Automatic Markdown export skipped: ${source} → ${destination}: ${reason}.${logHint} Click to open destination.`, 12000);
+				notice.messageEl.addEventListener('click', () => {
+					const file = this.app.vault.getFileByPath(destination);
+					if (file) void this.app.workspace.getLeaf().openFile(file);
+				});
+			});
+		try {
+			await this.automaticMarkdownExport.recover();
+		} catch (error) {
+			new Notice(`Automatic Markdown rename recovery needs review: ${error instanceof Error ? error.message : String(error)}`);
+		}
+		this.registerEvent(this.app.vault.on('create', (file) => {
+			if (file instanceof TFile) this.automaticMarkdownExport?.schedule(file);
+		}));
+		this.registerEvent(this.app.vault.on('modify', (file) => {
+			if (file instanceof TFile) this.automaticMarkdownExport?.schedule(file);
+		}));
+		this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
+			if (file instanceof TFile) this.automaticMarkdownExport?.rename(file, oldPath);
+		}));
 
 		this.addSettingTab(new SupernoteSettingTab(this.app, this));
+		this.addCommand({
+			id: 'restart-missing-automatic-markdown-export',
+			name: 'Regenerate missing Markdown export for this note',
+			checkCallback: (checking) => {
+				const source = this.app.workspace.getActiveFile()?.path;
+				const candidate = source && this.automaticMarkdownExport?.missingExportCandidate(source);
+				if (!candidate) return false;
+				if (!checking) {
+					const modal = new Modal(this.app);
+					modal.setTitle('Regenerate missing Markdown export');
+					modal.contentEl.createEl('p', { text: `Source: ${candidate.source}` });
+					modal.contentEl.createEl('p', { text: `Destination: ${candidate.destination}` });
+					modal.contentEl.createEl('p', { text: 'Discard the missing export\'s saved ownership and pending rename history, then generate a new Markdown export. Existing files and exports with page attachments will not be changed.' });
+					new Setting(modal.contentEl).addButton((button) => button.setButtonText('Regenerate').setCta().onClick(() => {
+						void this.automaticMarkdownExport!.restartMissingExport(candidate.source).then(() => {
+							modal.close();
+							new Notice('Missing Markdown export history cleared; regeneration queued');
+						}).catch((error: unknown) => {
+							new Notice(`Could not regenerate Markdown export: ${error instanceof Error ? error.message : String(error)}`);
+						});
+					})).addButton((button) => button.setButtonText('Cancel').onClick(() => modal.close()));
+					modal.open();
+				}
+				return true;
+			},
+		});
+		this.addCommand({
+			id: 'resume-automatic-markdown-export',
+			name: 'Resume automatic export for this file',
+			checkCallback: (checking) => {
+				const destination = this.app.workspace.getActiveFile()?.path;
+				const candidate = destination && this.automaticMarkdownExport?.resumeCandidate(destination);
+				if (!candidate) return false;
+				if (!checking) {
+					const modal = new Modal(this.app);
+					modal.setTitle('Resume automatic export for this file');
+					modal.contentEl.createEl('p', { text: `Mapping: ${candidate.mapping}` });
+					modal.contentEl.createEl('p', { text: `Source: ${candidate.source}` });
+					modal.contentEl.createEl('p', { text: `Destination: ${candidate.destination}` });
+					modal.contentEl.createEl('p', { text: 'Confirm that you have reviewed this Markdown file. Its current content becomes the baseline; it will not be overwritten until the source changes again.' });
+					new Setting(modal.contentEl).addButton((button) => button.setButtonText('Resume automatic export').setCta().onClick(() => {
+						void this.automaticMarkdownExport!.resume(candidate.destination).then(() => {
+							modal.close();
+							new Notice('Automatic Markdown export resumed for this file');
+						}).catch((error: unknown) => {
+							new Notice(`Could not resume automatic Markdown export: ${error instanceof Error ? error.message : String(error)}`);
+						});
+					})).addButton((button) => button.setButtonText('Cancel').onClick(() => modal.close()));
+					modal.open();
+				}
+				return true;
+			},
+		});
 
 		this.addCommand({
 			id: 'attach-file-from-device',
@@ -1760,6 +1863,7 @@ export default class SupernotePlugin extends Plugin {
 	}
 
 	onunload() {
+		this.automaticMarkdownExport?.stop();
 		terminateSharedWorkerPool();
 	}
 
@@ -1791,6 +1895,7 @@ export default class SupernotePlugin extends Plugin {
 	}
 
 	async saveSettings() {
+		this.automaticMarkdownExport?.settingsChanged();
 		await this.saveData(this.settings);
 	}
 }
